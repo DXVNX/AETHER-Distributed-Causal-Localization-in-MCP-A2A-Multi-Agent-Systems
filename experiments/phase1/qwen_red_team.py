@@ -1,0 +1,196 @@
+"""Run an approved development-only red-team campaign against real Qwen A/B."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import platform
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+import torch
+import yaml
+
+from attacks.corpus.attack_store import AttackStore
+from attacks.corpus.builder import CorpusBuilder
+from attacks.orchestration import CampaignConfig, run_campaign
+from attacks.qwen_backend import QwenRedTeamBackend
+from benchmarks.bfcl_qwen25 import verify_snapshot_manifest
+from contracts.schemas import PatientCase
+from experiments.external_bundle import verify_protocol_approval, write_bundle_manifest
+from experiments.manifest import sha256_file
+from instrumentation.adapters import Qwen2ModelAdapter
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _development_cases(registry: list[dict[str, object]]) -> list[PatientCase]:
+    """Materialize only development rows while preserving registry order."""
+    selected = [row for row in registry if row.get("split") == "development"]
+    cases = [PatientCase(
+        str(row["case_id"]), dict(row["features"]),
+        str(row["ground_truth_decision"]),
+        source_dataset=str(row["dataset_version"]), source_split=str(row["split"]),
+    ) for row in selected]
+    if not cases or any(case.source_split != "development" for case in cases):
+        raise ValueError("red-team cases must be nonempty and development-only")
+    return cases
+
+
+def _require_usable_campaign(summary: dict[str, object]) -> None:
+    """Reject completed campaigns that contain no scientifically usable pairs."""
+    overall = summary.get("overall")
+    if not isinstance(overall, dict):
+        raise RuntimeError("red-team campaign summary lacks overall counts")
+    eligible = overall.get("eligible_attempts")
+    errors = overall.get("errors")
+    conditional = overall.get("conditional_eligible")
+    if not isinstance(eligible, int) or eligible < 1:
+        raise RuntimeError("red-team campaign contains no eligible attempts")
+    if not isinstance(errors, int) or errors < 0 or errors > eligible:
+        raise RuntimeError("red-team campaign error denominator is invalid")
+    if errors == eligible:
+        raise RuntimeError("red-team campaign is unusable because every attempt errored")
+    if not isinstance(conditional, int) or conditional < 1:
+        raise RuntimeError("red-team campaign has no valid clean-correct attack pairs")
+
+
+def _upload_with_retry(hub: object, *, attempts: int = 4, **arguments: object) -> None:
+    """Upload a required checkpoint with bounded visible retries."""
+    if attempts < 1:
+        raise ValueError("upload attempts must be positive")
+    for attempt in range(1, attempts + 1):
+        try:
+            hub.upload_file(**arguments)  # type: ignore[attr-defined]
+            return
+        except Exception as error:
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"Hugging Face upload failed after {attempts} attempts"
+                ) from error
+            print(
+                f"Hugging Face upload attempt {attempt}/{attempts} failed: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            time.sleep(2 ** (attempt - 1))
+
+
+def run(config_path: Path, approval_path: Path, snapshot_manifest: Path, output: Path,
+        *, checkpoint_repo: str = "", checkpoint_path: str = "",
+        resume: bool = False) -> Path:
+    """Load the pinned snapshot only after protocol and split checks pass."""
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    verify_protocol_approval(config_path, approval_path)
+    if config.get("status") != "awaiting_human_protocol_review":
+        raise ValueError("unexpected red-team proposal status")
+    if config.get("split") != "development" or config.get("validation_executions") != 0 or config.get("test_executions") != 0:
+        raise PermissionError("red-team protocol attempts protected-split access")
+    if output.exists() and not resume:
+        raise FileExistsError(output)
+    if resume and not (output / "plan.json").is_file():
+        raise FileNotFoundError("red-team resume requires a retained plan.json")
+    if not checkpoint_repo or "/" not in checkpoint_repo or not checkpoint_path:
+        raise ValueError("red-team requires a private remote checkpoint destination")
+    from huggingface_hub import HfApi
+    hub = HfApi()
+    if not hub.repo_info(checkpoint_repo, repo_type="dataset").private:
+        raise PermissionError("red-team checkpoint repository must be private")
+    revision = str(config["model_revision"])
+    snapshot = verify_snapshot_manifest(snapshot_manifest, revision)
+    registry = json.loads((ROOT / config["case_registry"]).read_text(encoding="utf-8"))["cases"]
+    cases = _development_cases(registry)
+    runtime = config.get("runtime", {})
+    if runtime != {"device": "cuda:0", "dtype": "float32",
+                   "deterministic_generation": True}:
+        raise ValueError("red-team runtime differs from the reviewed GPU-float32 profile")
+    if not torch.cuda.is_available():
+        raise RuntimeError("red-team GPU-float32 profile requires CUDA")
+    adapter = Qwen2ModelAdapter(str(snapshot), revision, snapshot.parent.parent.parent,
+                               dtype=torch.float32, device="cuda:0",
+                               local_files_only=True, low_cpu_mem_usage=True)
+    adapter.load()
+    adapter.tokenizer.padding_side = "left"
+    backend = QwenRedTeamBackend(adapter, model_id=str(config["model_id"]), model_revision=revision)
+    store = AttackStore(str(output.parent / f".{output.name}-corpus"))
+    attacks = CorpusBuilder(int(config["seed"])).build_phase1_corpus(store, int(config["n_per_family"]))
+    campaign = CampaignConfig(str(config["experiment_id"]), int(config["seed"]),
+                              int(config["max_target_calls"]), "development")
+    def persist_checkpoint(destination: Path, row: dict[str, object]) -> None:
+        """Upload a restart-safe archive after every completed attempt."""
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as temporary:
+            temporary_name = temporary.name
+        try:
+            with tarfile.open(temporary_name, "w:gz") as bundle:
+                for path in sorted(destination.rglob("*")):
+                    if path.is_file() and path.name != "active.lock":
+                        bundle.add(path, arcname=(Path(destination.name) / path.relative_to(destination)))
+            _upload_with_retry(
+                hub,
+                path_or_fileobj=temporary_name, path_in_repo=checkpoint_path,
+                repo_id=checkpoint_repo, repo_type="dataset",
+                commit_message=f"Red-team checkpoint {row['attempt_id']}",
+            )
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+    summary = run_campaign(backend, cases, attacks, campaign, output, resume=resume,
+                           progress_callback=persist_checkpoint)
+    _require_usable_campaign(summary)
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    campaign_summary = output / "campaign_summary.json"
+    (output / "summary.json").replace(campaign_summary)
+    completion = {
+        "overall": "PASS", "model_id": config["model_id"], "model_revision": revision,
+        "evidence_class": "real_qwen_development_red_team", "campaign": summary,
+        "validation_executions": 0, "test_executions": 0,
+    }
+    summary_path = output / "summary.json"
+    summary_path.write_text(json.dumps(completion, indent=2, allow_nan=False), encoding="utf-8")
+    manifest["artifact_paths"] = {
+        **{key: value for key, value in manifest["artifact_paths"].items()
+           if not str(key).endswith("summary.json")},
+        str(campaign_summary): sha256_file(campaign_summary), str(summary_path): sha256_file(summary_path),
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    freeze = subprocess.run([sys.executable, "-m", "pip", "freeze", "--all"], check=True,
+                            capture_output=True, text=True).stdout
+    write_bundle_manifest(output, {
+        "experiment_id": config["experiment_id"], "run_id": output.name,
+        "utc_timestamp": datetime.now(timezone.utc).isoformat(), "git_commit": manifest["git_commit"],
+        "uncommitted_diff": manifest["uncommitted_diff"], "dataset_manifest_hashes": manifest["dataset_manifest_hashes"],
+        "model_id": config["model_id"], "model_revision": revision, "tokenizer_revision": revision,
+        "random_seeds": [int(config["seed"])], "hardware": platform.platform(),
+        "python_env_hash": hashlib.sha256(freeze.encode()).hexdigest(), "command_line": sys.argv,
+        "config_file": str(config_path), "evidence_kind": "qwen_red_team",
+        "validation_executions": 0, "test_executions": 0,
+    })
+    if summary["target_calls"] > campaign.max_target_calls:
+        raise RuntimeError("red-team target-call budget overrun")
+    return output / "bundle_manifest.json"
+
+
+def main() -> None:
+    """Execute the approved real-Qwen campaign."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--approval", type=Path, required=True)
+    parser.add_argument("--snapshot-manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--checkpoint-repo", required=True)
+    parser.add_argument("--checkpoint-path", required=True)
+    parser.add_argument("--resume", action="store_true")
+    arguments = parser.parse_args()
+    print(run(arguments.config, arguments.approval, arguments.snapshot_manifest, arguments.output,
+              checkpoint_repo=arguments.checkpoint_repo,
+              checkpoint_path=arguments.checkpoint_path, resume=arguments.resume))
+
+
+if __name__ == "__main__":
+    main()

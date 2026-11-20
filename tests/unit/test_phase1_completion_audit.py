@@ -1,0 +1,57 @@
+"""Tests for the evidence-backed Phase-1 completion audit."""
+
+from __future__ import annotations
+
+import json
+
+import yaml
+
+from scripts.audit_phase1_completion import audit
+
+
+def test_repository_completion_audit_reports_known_evidence_and_open_gates() -> None:
+    report = audit()
+    statuses = {row["id"]: row["status"] for row in report["gates"]}
+    assert report["overall"] == "INCOMPLETE"
+    assert statuses["qwen_qualification"] == "PASS"
+    assert statuses["qwen_instrumentation_acceptance"] == "PASS"
+    assert statuses["qwen_development_capture"] == "PASS"
+    assert statuses["qci_discovery_interventions"] == "PASS"
+    assert statuses["qci_development_audit"] == "NOT_APPLICABLE"
+    assert statuses["qci2_semantic_discovery"] == "PASS"
+    assert statuses["qci2_semantic_development_audit"] == "PASS"
+    assert statuses["tracr_known_structure_intervention"] in {"MISSING", "PASS"}
+    assert statuses["ioi_causal_calibration"] == "PASS"
+
+
+def test_agent_c_completion_gate_accepts_integrity_without_claiming_improvement() -> None:
+    report = audit()
+    agent_c = next(row for row in report["gates"] if row["id"] == "real_qwen_agent_c")
+
+    assert agent_c["status"] == "PASS"
+    assert agent_c["path"].replace("\\", "/").endswith(
+        "results/phase1/agent_c/qwen15b/summary.json")
+
+
+def test_completed_negative_experiments_remain_failed_scientific_gates() -> None:
+    statuses = {row["id"]: row["status"] for row in audit()["gates"]}
+    assert statuses["trained_sae_qwen_evaluation"] == "FAIL"
+    assert statuses["second_model_qualification"] == "FAIL"
+
+
+def test_completion_audit_rejects_missing_predicate(tmp_path) -> None:
+    (tmp_path / "evidence.json").write_text(json.dumps({"overall": "PASS"}), encoding="utf-8")
+    config = {
+        "schema_version": "aether.phase1-completion.v1",
+        "claim_boundary": "test",
+        "gates": [{
+            "id": "gate", "category": "test", "kind": "json",
+            "path": "evidence.json", "expect": {"test_executions": 0},
+        }],
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    report = audit(tmp_path, config_path)
+    assert report["overall"] == "INCOMPLETE"
+    assert report["gates"][0]["status"] == "FAIL"
+    assert "missing predicate" in report["gates"][0]["reasons"][0]

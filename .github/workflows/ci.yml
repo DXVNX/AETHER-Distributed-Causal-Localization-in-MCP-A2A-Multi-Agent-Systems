@@ -1,0 +1,22 @@
+name: Source and evidence checks
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install isolated research dependencies
+        run: |
+          python -m pip install -r requirements-demo-lock.txt
+          python -m pip install --no-deps -e .
+          python -m pip check
+      - name: Prepare frozen reference paths
+        run: python scripts/prepare_submission.py
+      - name: Verify implementation
+        run: python -m pytest tests/unit tests/integration tests/regression -ra
+      - name: Validate repository artifacts
+        run: python scripts/validate_repository.py

@@ -1,0 +1,3 @@
+# Demo-only direct requirements. Install from a verified wheelhouse.
+-r requirements-demo-runtime.txt
+mcp==2.3.0

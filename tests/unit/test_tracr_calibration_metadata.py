@@ -1,0 +1,56 @@
+"""Tests for bounded Tracr calibration metadata."""
+
+import json
+from pathlib import Path
+
+from causal.remediation_freeze import frozen_text_hash_matches
+
+
+def test_tracr_config_is_pinned_and_classified_narrowly() -> None:
+    config = json.loads(Path("calibration/tracr/config.json").read_text(encoding="utf-8"))
+    assert config["revision"] == "9ce2b8c82b6ba10e62e86cf6f390e7536d4fd2cd"
+    assert config["license"] == "Apache-2.0"
+    assert config["program"] == "tracr.compiler.lib.make_reverse(rasp.tokens)"
+    assert config["environment"] == ".venv-tracr"
+    intervention = config["intervention"]
+    assert intervention["status"] == "prospectively_frozen_before_any_parameter_ablation"
+    assert len(intervention["targets"]) == 8
+    assert intervention["selection_policy"] == "exhaustive_no_posthoc_target_selection"
+
+
+def test_completed_tracr_manifest_integrity() -> None:
+    manifest_path = Path("results/calibration/tracr/manifest.json")
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for path_key, hash_key in (
+        ("config_path", "config_sha256"),
+        ("result_path", "result_sha256"),
+        ("environment_path", "environment_sha256"),
+    ):
+        path = Path(manifest[path_key])
+        assert path.exists()
+        assert frozen_text_hash_matches(path, manifest[hash_key])
+
+
+def test_tracr_intervention_evidence_when_current_config_was_executed() -> None:
+    manifest_path = Path("results/calibration/tracr_intervention/manifest.json")
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    config_path = Path(manifest["config_path"])
+    if not frozen_text_hash_matches(config_path, manifest["config_sha256"]):
+        return
+    summary = json.loads(Path(manifest["result_path"]).read_text(encoding="utf-8"))
+    assert summary["intervention"]["performed"] is True
+    assert summary["intervention"]["overall"] == "PASS"
+    assert all(summary["intervention"]["predicates"].values())
+    assert summary["validation_executions"] == summary["test_executions"] == 0
+    required = {
+        "run_id", "git_commit", "uncommitted_diff", "dataset_manifest_hashes",
+        "model_id", "model_revision", "tokenizer_revision", "prompt_versions",
+        "random_seeds", "hardware", "python_env_hash", "command_line",
+        "config_file", "raw_output_path", "artifact_paths",
+    }
+    assert required <= set(manifest)
+    assert manifest["uncommitted_diff"] is False

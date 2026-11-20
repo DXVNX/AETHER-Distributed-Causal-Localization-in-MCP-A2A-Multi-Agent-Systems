@@ -1,0 +1,30 @@
+{
+  "docs/MODEL_QUALIFICATION_PROTOCOL.md": {
+    "source": "protocols/MODEL_QUALIFICATION_PROTOCOL.txt",
+    "sha256": "31c7507bdc38d4eb52472c6bc62e0e1af54298827b89bf4742dd2a2d74293a80"
+  },
+  "docs/CAUSAL_SPECIFICITY_PROTOCOL.md": {
+    "source": "protocols/CAUSAL_SPECIFICITY_PROTOCOL.txt",
+    "sha256": "7f5a881282b20bec4932aa6677aaa9d5e599e3c500d6c69b1ba96d0ddc4b6579"
+  },
+  "docs/BALANCED_SUBSTRATE_V2.md": {
+    "source": "protocols/BALANCED_SUBSTRATE_V2.txt",
+    "sha256": "d0e61c4001977b1587626fd9bdef62160999a4858da423f977ec2f3348e12a80"
+  },
+  "docs/GENERATION_STEP_INTERVENTION.md": {
+    "source": "protocols/GENERATION_STEP_INTERVENTION.txt",
+    "sha256": "be1c4a4d91dff10a876ff0613b021e962c8e04406bef18791411577ca19ac182"
+  },
+  "docs/QWEN_HEAD_INSTRUMENTATION.md": {
+    "source": "protocols/QWEN_HEAD_INSTRUMENTATION.txt",
+    "sha256": "2ec6017af5e8f1074af56c36562d94aed5413a94ba0778a72ffb60be7fecf51a"
+  },
+  "docs/MCPTox_INTEGRATION.md": {
+    "source": "protocols/MCPTox_INTEGRATION.txt",
+    "sha256": "e895f9d991ca11075838ed73866b56c4a17599ca7bc69cd2879a44c61cb4903e"
+  },
+  "docs/TAMAS_INTEGRATION.md": {
+    "source": "protocols/TAMAS_INTEGRATION.txt",
+    "sha256": "f9661b6a6fa0c2bbbbd343db09470f24ef30e38e82df35ae48388d2284b4b2e1"
+  }
+}
